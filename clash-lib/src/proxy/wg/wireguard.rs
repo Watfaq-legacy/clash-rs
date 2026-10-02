@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use async_recursion::async_recursion;
 use boringtun::{
     noise::{Tunn, TunnResult, errors::WireGuardError},
     x25519::{PublicKey, StaticSecret},
@@ -339,11 +338,7 @@ impl WireguardTunnel {
         }
     }
 
-    #[async_recursion]
-    async fn handle_routine_result<'a: 'async_recursion>(
-        &self,
-        result: TunnResult<'a>,
-    ) {
+    async fn handle_routine_result(&self, result: TunnResult<'_>) {
         match result {
             TunnResult::Done => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -356,17 +351,29 @@ impl WireguardTunnel {
                     peer.format_handshake_initiation(&mut buf[..], false);
                 drop(peer);
 
-                self.handle_routine_result(tun_result).await;
+                match tun_result {
+                    TunnResult::Done => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    TunnResult::WriteToNetwork(packet) => {
+                        if let Err(e) = self.udp_send(packet).await {
+                            error!("failed to send packet: {}", e);
+                        }
+                    }
+                    TunnResult::Err(e) => {
+                        error!("wireguard error: {e:?}");
+                    }
+                    _ => {
+                        error!("unexpected result from wireguard");
+                    }
+                }
             }
             TunnResult::Err(e) => {
                 error!("wireguard error: {e:?}");
             }
             TunnResult::WriteToNetwork(packet) => {
-                match self.udp_send(packet).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("failed to send packet: {}", e);
-                    }
+                if let Err(e) = self.udp_send(packet).await {
+                    error!("failed to send packet: {}", e);
                 }
             }
             _ => {
