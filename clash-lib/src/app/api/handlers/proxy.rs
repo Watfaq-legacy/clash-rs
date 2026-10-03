@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -14,31 +18,36 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
+    RuntimeComponents,
     app::{
         api::{
             AppState,
             handlers::utils::{DelayRequest, group_url_test},
         },
         outbound::manager::ThreadSafeOutboundManager,
-        profile::ThreadSafeCacheFile,
     },
     proxy::AnyOutboundHandler,
 };
 
 #[derive(Clone)]
 pub struct ProxyState {
-    outbound_manager: ThreadSafeOutboundManager,
-    cache_store: ThreadSafeCacheFile,
+    components: Arc<RwLock<Arc<RuntimeComponents>>>,
+}
+
+impl ProxyState {
+    fn components(&self) -> Arc<RuntimeComponents> {
+        self.components.read().unwrap().clone()
+    }
+
+    fn outbound_manager(&self) -> ThreadSafeOutboundManager {
+        self.components().outbound_manager.clone()
+    }
 }
 
 pub fn routes(
-    outbound_manager: ThreadSafeOutboundManager,
-    cache_store: ThreadSafeCacheFile,
+    components: Arc<RwLock<Arc<RuntimeComponents>>>,
 ) -> Router<Arc<AppState>> {
-    let state = ProxyState {
-        outbound_manager,
-        cache_store,
-    };
+    let state = ProxyState { components };
     Router::new()
         .route("/", get(get_proxies))
         .nest(
@@ -56,7 +65,7 @@ pub fn routes(
 }
 
 async fn get_proxies(State(state): State<ProxyState>) -> impl IntoResponse {
-    let outbound_manager = state.outbound_manager.clone();
+    let outbound_manager = state.outbound_manager();
     let mut res = HashMap::new();
     let proxies = outbound_manager.get_proxies().await;
     res.insert("proxies".to_owned(), proxies);
@@ -69,9 +78,12 @@ async fn find_proxy_by_name(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let outbound_manager = state.outbound_manager.clone();
+    let components = state.components();
+    let outbound_manager = components.outbound_manager.clone();
     match outbound_manager.get_outbound(&name).await {
         Some(proxy) => {
+            req.extensions_mut().insert(components);
+            req.extensions_mut().insert(outbound_manager);
             req.extensions_mut().insert(proxy);
             next.run(req).await
         }
@@ -81,10 +93,9 @@ async fn find_proxy_by_name(
 }
 
 async fn get_proxy(
+    Extension(outbound_manager): Extension<ThreadSafeOutboundManager>,
     Extension(proxy): Extension<AnyOutboundHandler>,
-    State(state): State<ProxyState>,
 ) -> impl IntoResponse {
-    let outbound_manager = state.outbound_manager.clone();
     axum::response::Json(outbound_manager.get_proxy(&proxy).await)
 }
 
@@ -95,15 +106,15 @@ struct UpdateProxyRequest {
 }
 
 async fn update_proxy(
-    State(state): State<ProxyState>,
+    Extension(components): Extension<Arc<RuntimeComponents>>,
     Extension(proxy): Extension<AnyOutboundHandler>,
     Json(payload): Json<UpdateProxyRequest>,
 ) -> impl IntoResponse {
-    let outbound_manager = state.outbound_manager.clone();
+    let outbound_manager = components.outbound_manager.clone();
     match outbound_manager.get_selector_control(proxy.name()) {
         Some(ctrl) => match ctrl.select(&payload.name).await {
             Ok(_) => {
-                let cache_store = state.cache_store;
+                let cache_store = components.cache_store.clone();
                 cache_store.set_selected(proxy.name(), &payload.name).await;
                 (
                     StatusCode::ACCEPTED,
@@ -133,11 +144,10 @@ async fn update_proxy(
 }
 
 async fn get_proxy_delay(
-    State(state): State<ProxyState>,
+    Extension(outbound_manager): Extension<ThreadSafeOutboundManager>,
     Extension(proxy): Extension<AnyOutboundHandler>,
     Query(q): Query<DelayRequest>,
 ) -> impl IntoResponse {
-    let outbound_manager = state.outbound_manager.clone();
     let timeout = Duration::from_millis(q.timeout.into());
     let name = proxy.name().to_owned();
     let mut headers = HeaderMap::new();
