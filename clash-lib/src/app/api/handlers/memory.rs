@@ -18,7 +18,7 @@ pub struct GetMemoryResponse {
 }
 
 pub async fn handle(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mgr = state.statistics_manager.clone();
+    let mgr = state.statistics_manager();
     let snapshot = GetMemoryResponse {
         inuse: mgr.memory_usage(),
         oslimit: 0,
